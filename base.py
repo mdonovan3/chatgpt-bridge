@@ -14,7 +14,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-CHROME_VERSION   = 137    # update if Chrome upgrades: google-chrome --version
+CHROME_VERSION   = 145    # update if Chrome upgrades: google-chrome --version
 RESPONSE_TIMEOUT = 180    # per-response timeout (seconds)
 SESSION_TIMEOUT  = 1800   # default total session time limit (seconds)
 _PROFILE_BASE    = pathlib.Path.home() / ".config"
@@ -47,6 +47,7 @@ class BaseAISession:
         self._log(f"Navigating to {self.URL} ...")
         self.driver.get(self.URL)
         time.sleep(random.uniform(2.5, 4))
+        self._wait_for_login()
         if new_conversation:
             self._ensure_new_chat()
 
@@ -72,6 +73,26 @@ class BaseAISession:
             window.chrome = { runtime: {} };
         """})
         return driver
+
+    def _wait_for_login(self, timeout=300):
+        """
+        If the textarea isn't present, assume we're on a login screen.
+        Print a prompt and block until the textarea appears (user logs in)
+        or timeout expires.
+        """
+        found = self.driver.find_elements(By.CSS_SELECTOR, self.SEL_TEXTAREA)
+        if found:
+            return  # already logged in
+        self._log("Not logged in — browser is open. Log in manually, then press Enter here.")
+        print("[chatgpt-bridge] Waiting for login (you have 5 minutes)...", flush=True)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.driver.find_elements(By.CSS_SELECTOR, self.SEL_TEXTAREA):
+                self._log("Login detected, continuing.")
+                time.sleep(1.5)
+                return
+            time.sleep(2)
+        raise RuntimeError("Login timeout — textarea never appeared.")
 
     def _ensure_new_chat(self):
         """Navigate to a blank conversation. Override if the AI needs a specific action."""
@@ -128,11 +149,32 @@ class BaseAISession:
 
     # ── Internal mechanics ────────────────────────────────────────────────────
 
+    def _dismiss_overlays(self):
+        """Dismiss any modal/dialog that might block input — press Escape up to 3 times."""
+        from selenium.webdriver.common.keys import Keys
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body")
+            for _ in range(3):
+                overlays = self.driver.find_elements(
+                    By.CSS_SELECTOR, '[data-state="open"][class*="fixed"]'
+                )
+                if not overlays:
+                    break
+                body.send_keys(Keys.ESCAPE)
+                time.sleep(0.6)
+        except Exception:
+            pass
+
     def _paste_message(self, text):
         driver = self.driver
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, self.SEL_TEXTAREA))
-        ).click()
+        )
+        self._dismiss_overlays()
+        # JS click bypasses overlay interception
+        driver.execute_script(
+            "document.querySelector(arguments[0])?.click();", self.SEL_TEXTAREA
+        )
         time.sleep(0.4)
 
         if self.PASTE_MODE == "clipboard":
