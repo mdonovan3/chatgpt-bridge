@@ -108,9 +108,12 @@ class BaseAISession:
     def send(self, message, timeout=RESPONSE_TIMEOUT):
         """Send one message, wait for the full response, return response text."""
         self._paste_message(message)
+        # Snapshot state BEFORE send so the response hasn't started yet
+        existing = self.driver.find_elements(By.CSS_SELECTOR, self.SEL_RESPONSE)
+        snapshot = (len(existing), existing[-1].text if existing else None)
         self._click_send()
         self._log(f"Turn {self._turn_count + 1} — waiting for response...")
-        response = self._wait_for_response(timeout)
+        response = self._wait_for_response(timeout, snapshot)
         self._turn_count += 1
         elapsed = time.time() - self._session_start
         self._log(f"Response received ({len(response)} chars) | turn {self._turn_count} | {elapsed:.0f}s elapsed")
@@ -177,65 +180,121 @@ class BaseAISession:
         )
         time.sleep(0.4)
 
-        if self.PASTE_MODE == "clipboard":
-            # DataTransfer paste event — works on React/contenteditable inputs
-            driver.execute_script("""
-                var el = document.querySelector(arguments[0]);
-                if (el) { el.focus(); el.innerHTML = ''; }
-            """, self.SEL_TEXTAREA)
-            time.sleep(0.2)
-            driver.execute_script("""
-                var el = document.querySelector(arguments[0]);
-                if (!el) return;
-                el.focus();
-                var dt = new DataTransfer();
-                dt.setData('text/plain', arguments[1]);
-                el.dispatchEvent(new ClipboardEvent('paste', {
-                    clipboardData: dt, bubbles: true, cancelable: true
-                }));
-            """, self.SEL_TEXTAREA, text)
-        else:
-            # "keys" mode — direct value injection + input event, works on plain textareas
-            driver.execute_script("""
-                var el = document.querySelector(arguments[0]);
-                if (!el) return;
-                el.focus();
-                var nativeInput = Object.getOwnPropertyDescriptor(
-                    window.HTMLTextAreaElement.prototype, 'value') ||
-                    Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
-                if (nativeInput) nativeInput.set.call(el, arguments[1]);
-                else el.value = arguments[1];
-                el.dispatchEvent(new Event('input',  {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-            """, self.SEL_TEXTAREA, text)
+        for attempt in range(3):
+            if self.PASTE_MODE == "clipboard":
+                # Clear via execCommand (respects ProseMirror/React state) then paste
+                driver.execute_script("""
+                    var el = document.querySelector(arguments[0]);
+                    if (!el) return;
+                    el.focus();
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('delete', false, null);
+                """, self.SEL_TEXTAREA)
+                time.sleep(0.2)
+                driver.execute_script("""
+                    var el = document.querySelector(arguments[0]);
+                    if (!el) return;
+                    el.focus();
+                    var dt = new DataTransfer();
+                    dt.setData('text/plain', arguments[1]);
+                    el.dispatchEvent(new ClipboardEvent('paste', {
+                        clipboardData: dt, bubbles: true, cancelable: true
+                    }));
+                """, self.SEL_TEXTAREA, text)
+            else:
+                # "keys" mode — direct value injection + input event, works on plain textareas
+                driver.execute_script("""
+                    var el = document.querySelector(arguments[0]);
+                    if (!el) return;
+                    el.focus();
+                    var nativeInput = Object.getOwnPropertyDescriptor(
+                        window.HTMLTextAreaElement.prototype, 'value') ||
+                        Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                    if (nativeInput) nativeInput.set.call(el, arguments[1]);
+                    else el.value = arguments[1];
+                    el.dispatchEvent(new Event('input',  {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                """, self.SEL_TEXTAREA, text)
 
-        time.sleep(random.uniform(0.6, 1.0))
+            time.sleep(random.uniform(0.6, 1.0))
+
+            # Verify text landed — check innerText of the textarea element
+            actual = driver.execute_script(
+                "return (document.querySelector(arguments[0])?.innerText || '').trim();",
+                self.SEL_TEXTAREA
+            )
+            if actual:
+                return  # success
+            self._log(f"Paste attempt {attempt+1} produced empty textarea, retrying...")
+            time.sleep(0.5)
+
+        raise RuntimeError("Failed to paste text into textarea after 3 attempts")
 
     def _click_send(self):
+        # Log textarea content length so we know paste actually worked
+        actual = self.driver.execute_script(
+            "return (document.querySelector(arguments[0])?.innerText || '').trim().length;",
+            self.SEL_TEXTAREA
+        )
+        self._log(f"Textarea content length before send: {actual}")
         try:
             btn = WebDriverWait(self.driver, 10).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, self.SEL_SEND))
             )
+            self._log("Send button found and clickable, clicking...")
             btn.click()
-        except Exception:
+        except Exception as e:
+            self._log(f"Send button not clickable ({e}), falling back to Enter key")
             ta = self.driver.find_element(By.CSS_SELECTOR, self.SEL_TEXTAREA)
             ta.send_keys(Keys.RETURN)
         time.sleep(2.5)
 
-    def _wait_for_response(self, timeout):
+    def _wait_for_response(self, timeout, snapshot=None):
+        """
+        Wait for a new, complete assistant message.
+
+        snapshot: (count, last_text) captured just before clicking send —
+        avoids the race where fast responses appear during the post-send sleep.
+        """
         driver   = self.driver
         deadline = time.time() + timeout
-        for _ in range(15):
-            if driver.find_elements(By.CSS_SELECTOR, self.SEL_STOP):
-                break
-            time.sleep(1)
+
+        if snapshot:
+            msg_count_before, last_text_before = snapshot
+        else:
+            existing = driver.find_elements(By.CSS_SELECTOR, self.SEL_RESPONSE)
+            msg_count_before = len(existing)
+            last_text_before = existing[-1].text if existing else None
+
+        self._log(f"Pre-send: {msg_count_before} msgs, last={len(last_text_before or '')} chars")
+
+        # Phase 1: wait for a new or changed assistant message
+        check = 0
+        while time.time() < deadline:
+            msgs = driver.find_elements(By.CSS_SELECTOR, self.SEL_RESPONSE)
+            check += 1
+            if check % 10 == 0:
+                n = len(msgs)
+                t = len(msgs[-1].text) if msgs else 0
+                self._log(f"  ...waiting ({n} msgs, last={t} chars)")
+            if len(msgs) > msg_count_before:
+                break  # new message appeared
+            if msgs and msgs[-1].text != last_text_before:
+                break  # last message text changed (new reply replaced old)
+            time.sleep(0.8)
+        else:
+            raise RuntimeError(f"No new response appeared within {timeout}s")
+
+        # Phase 2: wait for stop button to disappear (streaming complete)
         while time.time() < deadline:
             if not driver.find_elements(By.CSS_SELECTOR, self.SEL_STOP):
                 break
             time.sleep(1.5)
         else:
             raise RuntimeError(f"Response did not complete within {timeout}s")
-        time.sleep(2)
+
+        # Phase 3: brief settle so final markdown renders
+        time.sleep(1.5)
         msgs = driver.find_elements(By.CSS_SELECTOR, self.SEL_RESPONSE)
         return msgs[-1].text if msgs else ""
 
